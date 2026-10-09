@@ -1,0 +1,30 @@
+#!/bin/bash
+# keyd-send  —  IPC bridge from keyd (root) to alt-input-daemon (user)
+# =====================================================================
+# keyd runs as root. The daemon socket is owner-only (srw-------) and
+# belongs to the logged-in user. Root cannot connect to it directly.
+# We use 'sudo -u "#<uid>"' to connect as the logged-in user.
+#
+# Usage: keyd-send <COMMAND>
+# Commands: ALT_DOWN  ALT_UP  PLUS  ZERO  1-9  a-f
+
+CMD="$1"
+
+for uid_dir in /run/user/*/; do
+    SOCK="${uid_dir}alt-input.sock"
+    if [[ -S "$SOCK" ]]; then
+        UID_NUM=$(basename "$uid_dir")
+        sudo -u "#${UID_NUM}" /usr/bin/python3 -c "
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    s.connect('${SOCK}')
+    s.sendall('${CMD}'.encode())
+    s.close()
+except Exception:
+    pass
+"
+        break
+    fi
+done

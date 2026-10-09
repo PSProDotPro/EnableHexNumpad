@@ -1,0 +1,19 @@
+[Unit]
+Description=Alt+Numpad Unicode/AltCode input daemon (Wayland)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/alt-input-daemon
+Restart=on-failure
+RestartSec=3
+
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/user/%U
+
+[Install]
+WantedBy=graphical-session.target
