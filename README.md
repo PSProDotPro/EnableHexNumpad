@@ -61,7 +61,7 @@ The install script handles all dependencies.
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/EnableHexNumpad.git
+git clone https://github.com/PSProDotPro/EnableHexNumpad.git
 cd EnableHexNumpad
 chmod +x install.sh keyd-send
 ./install.sh
