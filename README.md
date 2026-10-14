@@ -80,7 +80,7 @@ chmod +x uninstall.sh
 
 ## Emergency Recovery
 
-If the keyboard ever locks up:
+If the keyboard ever locks up (and it hasn't on me since about v2 under a totally different mechanical schema when I was still experimenting):
 
 | Method | Command |
 |--------|---------|
