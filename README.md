@@ -46,6 +46,44 @@ Works in all window types — native Wayland and XWayland alike.
 
 ---
 
+## Changelog
+
+### v7 — fixes "pastes the old clipboard contents instead of my character"
+
+**If you installed v6 and the wrong thing pastes (whatever was on the
+clipboard before you typed the code), upgrade to v7.**
+
+v6 assumed every machine's Wayland socket was named `wayland-0` and the
+XWayland display was `:0`. On a machine where the socket is named differently
+(for example `wayland-1`), `wl-copy` could not reach the compositor, the
+clipboard never changed, and Ctrl+V pasted the previous clipboard contents.
+The daemon also reported success anyway, because it only confirmed that
+Ctrl+V had been pressed.
+
+v7:
+- Finds the live Wayland socket and X display at the moment of each emission
+  instead of assuming their names.
+- Detects and logs `wl-copy` failures (with the real error message) and skips
+  the paste, instead of silently pasting stale clipboard contents.
+- Logs the detected `WAYLAND_DISPLAY` / `DISPLAY` at startup.
+
+To check what your machine uses: `ls /run/user/$(id -u) | grep wayland`
+
+To upgrade an existing install without re-running the installer:
+
+```bash
+sudo install -m 0755 alt-input-daemon.py /usr/local/bin/alt-input-daemon
+systemctl --user restart alt-input-daemon
+journalctl --user -n 10 --no-pager -u alt-input-daemon
+```
+
+The startup log should show a `Detected: WAYLAND_DISPLAY=...` line.
+
+### v6
+Persistent `wl-copy` process, pre-warmed at startup.
+
+---
+
 ## Requirements
 
 - Fedora 44 (may work on other Fedora versions — untested)
@@ -61,7 +99,7 @@ The install script handles all dependencies.
 ## Install
 
 ```bash
-git clone https://github.com/PSProDotPro/EnableHexNumpad.git
+git clone https://github.com/YOUR_USERNAME/EnableHexNumpad.git
 cd EnableHexNumpad
 chmod +x install.sh keyd-send
 ./install.sh
@@ -80,7 +118,7 @@ chmod +x uninstall.sh
 
 ## Emergency Recovery
 
-If the keyboard ever locks up (and it hasn't on me since about v2 under a totally different mechanical schema when I was still experimenting):
+If the keyboard ever locks up:
 
 | Method | Command |
 |--------|---------|

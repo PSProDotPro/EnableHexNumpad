@@ -2,7 +2,23 @@
 """
 alt-input-daemon  —  Wayland Alt+Numpad input daemon
 ======================================================
-Replicates Windows AltCode and EnableHexNumpad behavior on KDE Plasma / Fedora 44.
+Replicates Windows AltCode and EnableHexNumpad behavior on KDE Plasma / Fedora.
+
+Version 7
+
+WHAT CHANGED IN v7
+------------------
+v6 hardcoded WAYLAND_DISPLAY=wayland-0 and DISPLAY=:0 for the wl-copy and
+xdotool subprocesses. On any machine whose compositor socket has a different
+name (e.g. wayland-1), wl-copy could not reach the compositor, the clipboard
+never changed, and Ctrl+V pasted whatever was on the clipboard beforehand.
+The daemon still logged "Emitted ... OK", because that only reported that
+xdotool had pressed Ctrl+V.
+
+v7 fixes both problems:
+  - The Wayland socket and X display are discovered at emission time instead
+    of assumed (see emit_env()).
+  - wl-copy failures are detected and logged instead of being swallowed.
 
 ARCHITECTURE
 ------------
@@ -27,15 +43,13 @@ EMISSION STRATEGY
 wl-copy runs as a persistent background process, keeping a warm connection
 to the Wayland clipboard manager at all times. On each emission:
 
-  1. Kill the previous wl-copy process if running
-  2. Start a new wl-copy <char> in the background (stays running)
-  3. Short delay (0.3s) for clipboard to register
-  4. xdotool key --clearmodifiers ctrl+v  →  paste into focused window
-  5. xdotool keyup alt ISO_Level3_Shift   →  release Alt modifiers
+  1. Start a new wl-copy <char> (replaces the clipboard selection)
+  2. Short delay (0.3s) for the clipboard to register
+  3. xdotool key --clearmodifiers ctrl+v  →  paste into focused window
+  4. xdotool keyup alt ISO_Level3_Shift   →  release Alt modifiers
 
 At daemon startup, wl-copy is pre-warmed with a space character so the
-clipboard connection is established before the first character is ever
-requested. This eliminates the cold-start delay entirely.
+clipboard connection is established before the first character is requested.
 
 COMMIT KEY
 ----------
@@ -52,14 +66,17 @@ REQUIREMENTS
 ------------
   wl-clipboard  (wl-copy)   sudo dnf install wl-clipboard
   xdotool                   sudo dnf install xdotool
-  XWayland                  running by default on KDE Plasma / Fedora 44
+  XWayland                  running by default on KDE Plasma
 """
 
+import glob
 import os
 import socket
+import stat
 import subprocess
 import sys
 import logging
+import tempfile
 import time
 
 logging.basicConfig(
@@ -70,15 +87,56 @@ logging.basicConfig(
 log = logging.getLogger('alt-input')
 
 UID = os.getuid()
-EMIT_ENV = {
-    **os.environ,
-    'DISPLAY': ':0',
-    'WAYLAND_DISPLAY': 'wayland-0',
-    'XDG_RUNTIME_DIR': f'/run/user/{UID}',
-}
 
 # Persistent wl-copy process — kept alive between emissions
 _wl_copy_proc = None
+
+# ---------------------------------------------------------------------------
+# Display discovery
+#
+# The Wayland socket name (wayland-0, wayland-1, ...) and the XWayland display
+# number (:0, :1, ...) are NOT constant across machines or sessions, so they
+# are looked up each time rather than hardcoded.
+# ---------------------------------------------------------------------------
+def _find_wayland_display(runtime_dir):
+    """Return the name of a live Wayland socket in runtime_dir, or None."""
+    cur = os.environ.get('WAYLAND_DISPLAY')
+    if cur:
+        path = cur if os.path.isabs(cur) else os.path.join(runtime_dir, cur)
+        if os.path.exists(path):
+            return cur
+    for path in sorted(glob.glob(os.path.join(runtime_dir, 'wayland-*'))):
+        if path.endswith('.lock'):
+            continue
+        try:
+            if stat.S_ISSOCK(os.stat(path).st_mode):
+                return os.path.basename(path)
+        except OSError:
+            continue
+    return cur  # may be None; wl-copy will report a clear error
+
+def _find_x_display():
+    """Return the XWayland DISPLAY value (e.g. ':0')."""
+    cur = os.environ.get('DISPLAY')
+    if cur:
+        return cur
+    socks = sorted(glob.glob('/tmp/.X11-unix/X*'))
+    if socks:
+        return ':' + os.path.basename(socks[0])[1:]
+    return ':0'
+
+def emit_env():
+    """Environment for the wl-copy / xdotool subprocesses."""
+    runtime_dir = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{UID}'
+    env = {
+        **os.environ,
+        'XDG_RUNTIME_DIR': runtime_dir,
+        'DISPLAY': _find_x_display(),
+    }
+    wayland = _find_wayland_display(runtime_dir)
+    if wayland:
+        env['WAYLAND_DISPLAY'] = wayland
+    return env
 
 # ---------------------------------------------------------------------------
 # CP437 table (OEM codepage, no leading zero)
@@ -125,10 +183,17 @@ def cp1252_to_char(code):
 # ---------------------------------------------------------------------------
 # wl-copy management
 # ---------------------------------------------------------------------------
-def wlcopy_start(char: str):
-    """Start a persistent wl-copy process with the given character."""
+def wlcopy_start(char, env):
+    """Start wl-copy with the given character. Returns True on success.
+
+    wl-copy normally forks into the background and its parent exits 0 almost
+    immediately. If it cannot reach the compositor, the parent exits non-zero
+    and prints the reason to stderr; that is captured and logged here so a
+    failed clipboard update is never silent.
+    """
     global _wl_copy_proc
-    # Kill previous instance if still running
+
+    # Stop the previous instance if it is still running
     if _wl_copy_proc is not None:
         try:
             _wl_copy_proc.terminate()
@@ -141,40 +206,51 @@ def wlcopy_start(char: str):
         _wl_copy_proc = None
 
     try:
-        _wl_copy_proc = subprocess.Popen(
-            ['wl-copy', char],
-            env=EMIT_ENV,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        log.debug('wl-copy started (pid=%d) for %r', _wl_copy_proc.pid, char)
+        with tempfile.TemporaryFile() as errf:
+            proc = subprocess.Popen(
+                ['wl-copy', char],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=errf,
+            )
+            try:
+                rc = proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                rc = None  # still running: serving the selection
+            if rc not in (None, 0):
+                errf.seek(0)
+                err = errf.read().decode('utf-8', errors='replace').strip()
+                log.error('wl-copy failed (exit %d): %s', rc, err or '(no message)')
+                return False
+        _wl_copy_proc = proc
+        log.debug('wl-copy started (pid=%d) for %r', proc.pid, char)
         return True
     except Exception as e:
         log.error('wl-copy failed to start: %s', e)
         return False
 
 def wlcopy_warmup():
-    """Pre-warm wl-copy at daemon startup with a space character.
-    This establishes the Wayland clipboard connection before any
-    character is requested, eliminating cold-start delay."""
+    """Pre-warm wl-copy at daemon startup with a space character."""
     log.info('Warming up wl-copy...')
-    if wlcopy_start(' '):
-        time.sleep(0.3)  # allow connection to establish
+    if wlcopy_start(' ', emit_env()):
+        time.sleep(0.3)
         log.info('wl-copy warmed up and ready')
     else:
-        log.warning('wl-copy warmup failed — first emission may be slow')
+        log.warning('wl-copy warmup failed — see the error above')
 
 # ---------------------------------------------------------------------------
 # Character emission
 # ---------------------------------------------------------------------------
-def emit_char(char: str):
+def emit_char(char):
     log.info('Emitting U+%04X %r', ord(char), char)
+    env = emit_env()
 
-    # Step 1: start persistent wl-copy with this character
-    if not wlcopy_start(char):
+    # Step 1: put the character on the Wayland clipboard
+    if not wlcopy_start(char, env):
+        log.error('Clipboard not updated; skipping paste of U+%04X', ord(char))
         return
 
-    # Step 2: short delay for clipboard to register and Alt to release
+    # Step 2: short delay for the clipboard to register
     time.sleep(0.3)
 
     # Step 3: inject Ctrl+V into the focused window via XWayland
@@ -182,7 +258,7 @@ def emit_char(char: str):
         subprocess.run(
             ['xdotool', 'key', '--clearmodifiers', 'ctrl+v'],
             check=True, timeout=5, capture_output=True,
-            env=EMIT_ENV,
+            env=env,
         )
         log.info('Emitted U+%04X %r OK', ord(char), char)
     except Exception as e:
@@ -193,7 +269,7 @@ def emit_char(char: str):
     try:
         subprocess.run(
             ['xdotool', 'keyup', 'alt', 'ISO_Level3_Shift'],
-            capture_output=True, timeout=5, env=EMIT_ENV,
+            capture_output=True, timeout=5, env=env,
         )
         log.debug('Alt released OK')
     except Exception as e:
@@ -316,16 +392,18 @@ def run():
     server.listen(32)
 
     log.info('Listening on %s (uid=%d)', sock_path, uid)
-    log.info('EMIT_ENV: WAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s DISPLAY=%s',
-             EMIT_ENV.get('WAYLAND_DISPLAY'), EMIT_ENV.get('XDG_RUNTIME_DIR'),
-             EMIT_ENV.get('DISPLAY'))
+
+    env = emit_env()
+    log.info('Detected: WAYLAND_DISPLAY=%s DISPLAY=%s XDG_RUNTIME_DIR=%s',
+             env.get('WAYLAND_DISPLAY'), env.get('DISPLAY'),
+             env.get('XDG_RUNTIME_DIR'))
 
     for tool in ['wl-copy', 'xdotool']:
         r = subprocess.run(['which', tool], capture_output=True, text=True)
         log.info('%s: %s', tool,
                  r.stdout.strip() if r.returncode == 0 else 'NOT FOUND')
 
-    # Pre-warm wl-copy so first emission has no cold-start delay
+    # Pre-warm wl-copy so the first emission has no cold-start delay
     wlcopy_warmup()
 
     fsm = AltInputFSM()
